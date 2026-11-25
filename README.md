@@ -1,4 +1,4 @@
-<div align="center">
+<img width="3010" height="1756" alt="1" src="https://github.com/user-attachments/assets/1b6afe2e-db71-4cd1-93b6-a37e781b82e5" /><div align="center">
 
 # 🏝️ 程序化秘境 (Procedural Mystic Realm)
 
@@ -28,9 +28,17 @@
 <div align="center">
   <!-- 在这里拖拽你的第一张图（白昼地貌） -->
 
+
+<img width="3010" height="1756" alt="1" src="https://github.com/user-attachments/assets/a7fd368d-6e7a-4bb5-80fc-21bc2a7ef5dd" />
+
   <!-- 在这里拖拽你的第二张图（黄昏秘境） -->
+![Uploading 2.png…]()
+![Uploading 4.png…]()
+![Uploading 3.png…]()
+
 
   <!-- 在这里拖拽你的第三张图（幽蓝星夜） -->
+  
 </div>
 <p align="center"><i>基于手写 fBm 地形算法与点精灵粒子系统的实机渲染截图</i></p>
 
