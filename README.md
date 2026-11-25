@@ -1,5 +1,3 @@
-<img width="3010" height="1756" alt="1" src="https://github.com/user-attachments/assets/1b6afe2e-db71-4cd1-93b6-a37e781b82e5" /><div align="center">
-
 # 🏝️ 程序化秘境 (Procedural Mystic Realm)
 
 **一个基于纯算法与底层数学推导生成的 3D 虚拟生态漫游系统**
@@ -32,9 +30,11 @@
 <img width="3010" height="1756" alt="1" src="https://github.com/user-attachments/assets/a7fd368d-6e7a-4bb5-80fc-21bc2a7ef5dd" />
 
   <!-- 在这里拖拽你的第二张图（黄昏秘境） -->
-![Uploading 2.png…]()
-![Uploading 4.png…]()
-![Uploading 3.png…]()
+<img width="3031" height="1778" alt="4" src="https://github.com/user-attachments/assets/eb7a6a58-2660-4400-af6e-67ebc66af702" />
+<img width="3001" height="1797" alt="3" src="https://github.com/user-attachments/assets/252fdae9-46f8-4313-b549-a22101021c20" />
+<img width="3036" height="1711" alt="2" src="https://github.com/user-attachments/assets/40822c4d-21bc-4300-8d11-17440f86a374" />
+<img width="3010" height="1756" alt="1" src="https://github.com/user-attachments/assets/a1969172-3918-409a-b0a0-3e712eea56c1" />
+
 
 
   <!-- 在这里拖拽你的第三张图（幽蓝星夜） -->
