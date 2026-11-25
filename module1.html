@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>模块1 · MVP 矩阵与相机控制</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0a1424;}
+  canvas{display:block;}
+  #hud{
+    position:fixed;left:12px;top:12px;z-index:10;white-space:pre;
+    font:12px/1.7 ui-monospace,Consolas,monospace;color:#bfe3ff;
+    background:rgba(8,16,28,.62);border:1px solid rgba(80,160,255,.25);
+    border-radius:8px;padding:10px 14px;pointer-events:none;
+  }
+  #hud b{color:#7fd4ff;}
+  #overlay{
+    position:fixed;inset:0;z-index:20;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:14px;
+    background:rgba(4,8,16,.78);color:#cfe9ff;cursor:pointer;
+    font:16px/1.8 system-ui,-apple-system,sans-serif;backdrop-filter:blur(4px);
+  }
+  #overlay h1{font-size:22px;margin:0;color:#8fd8ff;letter-spacing:3px;}
+  #overlay .k{color:#7fd4ff;font-weight:700;}
+  #overlay.hide{display:none;}
+</style>
+</head>
+<body>
+
+<div id="hud"></div>
+<div id="overlay">
+  <h1>程序化秘境 · 模块1</h1>
+  <div>点击屏幕进入第一人称漫游</div>
+  <div><span class="k">WASD</span> 移动 · <span class="k">Space/Shift</span> 升降 ·
+       <span class="k">鼠标</span> 视角 · <span class="k">V</span> 切换投影 ·
+       <span class="k">[ ]</span> 调节 FOV · <span class="k">ESC</span> 释放鼠标</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ==========================================================
+   0. 渲染器 / 场景 / 灯光
+   ========================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a1424);
+scene.fog = new THREE.FogExp2(0x0a1424, 0.0032);
+
+scene.add(new THREE.HemisphereLight(0x9fd8ff, 0x102030, 1.0));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(60, 90, 40);
+scene.add(sun);
+
+/* --- 占位场景：用于肉眼观察透视/正交差异 --- */
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(600, 600),
+  new THREE.MeshStandardMaterial({ color: 0x16263a, roughness: 1.0, metalness: 0.0 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.02;
+scene.add(ground);
+
+scene.add(new THREE.GridHelper(600, 120, 0x2e5c8a, 0x14263a));
+
+// 用确定性伪随机散布参照柱（这样每次刷新布局一致，方便对比截图）
+let seed = 1337;
+const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+
+for (let i = 0; i < 60; i++) {
+  const r = 8 + rand() * 90;
+  const a = rand() * Math.PI * 2;
+  const h = 2 + rand() * 12;
+  const isBox = rand() > 0.5;
+  const geo = isBox
+    ? new THREE.BoxGeometry(2.2, h, 2.2)
+    : new THREE.CylinderGeometry(1.0, 1.3, h, 14);
+  const mat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color().setHSL(0.52 + rand() * 0.22, 0.65, 0.55),
+    roughness: 0.6, metalness: 0.15
+  });
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(Math.cos(a) * r, h / 2, Math.sin(a) * r);
+  scene.add(m);
+}
+
+// 原点坐标轴，方便辨认朝向
+scene.add(new THREE.AxesHelper(12));
+
+/* ==========================================================
+   1. 手写投影矩阵
+   ========================================================== */
+
+/**
+ * 透视投影矩阵（右手系，相机看向 -Z，裁剪空间 z ∈ [-1,1]）
+ *   x_ndc = (n/r · x) / (-z),  y_ndc = (n/t · y) / (-z)
+ *   第 4 行为 (0,0,-1,0) → w_c = -z，透视除法由此产生"近大远小"
+ */
+function makePerspective(fovY, aspect, n, f, out) {
+  const t = n * Math.tan(fovY * 0.5);  // 近平面半高
+  const r = t * aspect;                // 近平面半宽
+  // Matrix4.set 按【行主序】书写，内部自动转列主序存储
+  out.set(
+    n / r, 0,     0,                     0,
+    0,     n / t, 0,                     0,
+    0,     0,    -(f + n) / (f - n),   -2 * f * n / (f - n),
+    0,     0,    -1,                     0
+  );
+  return out;
+}
+
+/**
+ * 正交投影矩阵：w_c 恒为 1，无透视除法 → 平行线保持平行
+ */
+function makeOrthographic(l, r, b, t, n, f, out) {
+  out.set(
+    2 / (r - l), 0,           0,           -(r + l) / (r - l),
+    0,           2 / (t - b), 0,           -(t + b) / (t - b),
+    0,           0,          -2 / (f - n), -(f + n) / (f - n),
+    0,           0,           0,            1
+  );
+  return out;
+}
+
+/* ==========================================================
+   2. 手写视图矩阵
+   ========================================================== */
+
+const _x = new THREE.Vector3();  // 相机右轴（世界空间）
+const _y = new THREE.Vector3();  // 相机上轴
+const _z = new THREE.Vector3();  // 相机后轴（相机看向 -Z）
+
+/**
+ * 由 (位置, yaw, pitch) 构造视图矩阵 = Rᵀ · T(-eye)
+ * 结果按行主序写入 out（行 = 相机基向量，第 4 列 = -dot(基, eye)）
+ */
+function buildViewMatrix(pos, yaw, pitch, out) {
+  const cy = Math.cos(yaw),  sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+
+  _x.set(cy, 0, -sy);                 // 右
+  _y.set(sy * sp, cp, cy * sp);       // 上
+  _z.set(sy * cp, -sp, cy * cp);      // 后
+
+  out.set(
+    _x.x, _x.y, _x.z, -_x.dot(pos),
+    _y.x, _y.y, _y.z, -_y.dot(pos),
+    _z.x, _z.y, _z.z, -_z.dot(pos),
+    0,    0,    0,    1
+  );
+  return out;
+}
+
+const _lookZ = new THREE.Vector3();
+const _lookX = new THREE.Vector3();
+const _lookY = new THREE.Vector3();
+
+/** 通用 lookAt（供正交「上帝视角」使用） */
+function buildLookAt(eye, target, up, out) {
+  _lookZ.subVectors(eye, target).normalize();          // 后
+  _lookX.crossVectors(up, _lookZ).normalize();         // 右
+  _lookY.crossVectors(_lookZ, _lookX);                 // 上
+  out.set(
+    _lookX.x, _lookX.y, _lookX.z, -_lookX.dot(eye),
+    _lookY.x, _lookY.y, _lookY.z, -_lookY.dot(eye),
+    _lookZ.x, _lookZ.y, _lookZ.z, -_lookZ.dot(eye),
+    0, 0, 0, 1
+  );
+  return out;
+}
+
+/* ==========================================================
+   3. 相机状态
+   ========================================================== */
+
+// Three.js 的 Camera 只作为"矩阵容器"；matrixAutoUpdate=false → 完全由我们接管
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
+camera.matrixAutoUpdate = false;
+camera.matrixWorldAutoUpdate = false;
+
+const projMat   = new THREE.Matrix4();
+const viewMat   = new THREE.Matrix4();
+const worldMat  = new THREE.Matrix4();
+
+const cam = {
+  pos:   new THREE.Vector3(0, 6, 34),
+  yaw:   0,                 // 绕世界 Y
+  pitch: -0.12,             // 绕相机局部 X（俯仰，必须夹紧）
+  fov:   THREE.MathUtils.degToRad(60),
+  near:  0.1,
+  far:   800
+};
+
+const ortho = {
+  eye:    new THREE.Vector3(58, 86, 58),
+  target: new THREE.Vector3(0, 0, 0),
+  up:     new THREE.Vector3(0, 1, 0),
+  size:   62,             // 半高
+  near:   0.1,
+  far:    600
+};
+
+let mode = 'persp';       // 'persp' | 'ortho'
+
+/* ==========================================================
+   4. 输入：指针锁定 + 键盘
+   ========================================================== */
+const canvas  = renderer.domElement;
+const overlay = document.getElementById('overlay');
+const hud     = document.getElementById('hud');
+const SENS    = 0.0022;   // rad / px
+const SPEED   = 14;       // 单位 / 秒
+const keys    = Object.create(null);
+
+overlay.addEventListener('click', () => canvas.requestPointerLock());
+canvas.addEventListener('click', () => {
+  if (document.pointerLockElement !== canvas) canvas.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', () => {
+  overlay.classList.toggle('hide', document.pointerLockElement === canvas);
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (document.pointerLockElement !== canvas) return;
+  // 鼠标右移 → 向右转 → yaw 减小（因为 yaw 增大是朝 -X 左转）
+  cam.yaw   -= e.movementX * SENS;
+  // 鼠标下移 → 向下看 → pitch 减小
+  cam.pitch -= e.movementY * SENS;
+  // 关键：夹紧 pitch，防止越过天顶后视线翻转
+  cam.pitch = THREE.MathUtils.clamp(cam.pitch, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
+});
+
+addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault();
+  if (e.code === 'KeyV') {
+    mode = (mode === 'persp') ? 'ortho' : 'persp';
+  }
+  if (e.code === 'BracketLeft') {
+    cam.fov = THREE.MathUtils.clamp(cam.fov - 0.05, 0.35, 1.6);
+  }
+  if (e.code === 'BracketRight') {
+    cam.fov = THREE.MathUtils.clamp(cam.fov + 0.05, 0.35, 1.6);
+  }
+});
+addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+/* ==========================================================
+   5. 每帧更新：位移 + 重建矩阵
+   ========================================================== */
+function updateMovement(dt) {
+  // 水平前向 / 右向（由 yaw 直接给出，避免 pitch 影响水平移动速度）
+  const fx = -Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
+  const rx =  Math.cos(cam.yaw), rz = -Math.sin(cam.yaw);
+
+  let mx = 0, mz = 0;
+  if (keys['KeyW']) { mx += fx; mz += fz; }
+  if (keys['KeyS']) { mx -= fx; mz -= fz; }
+  if (keys['KeyD']) { mx += rx; mz += rz; }
+  if (keys['KeyA']) { mx -= rx; mz -= rz; }
+
+  const len = Math.hypot(mx, mz);
+  if (len > 1e-6) {
+    const s = (SPEED * dt) / len;
+    cam.pos.x += mx * s;
+    cam.pos.z += mz * s;
+  }
+  if (keys['Space']) cam.pos.y += SPEED * dt;
+  if (keys['ShiftLeft'] || keys['ShiftRight']) cam.pos.y -= SPEED * dt;
+
+  cam.pos.y = THREE.MathUtils.clamp(cam.pos.y, 1.2, 150);
+}
+
+function updateMatrices() {
+  const aspect = innerWidth / innerHeight;
+
+  if (mode === 'persp') {
+    makePerspective(cam.fov, aspect, cam.near, cam.far, projMat);
+    buildViewMatrix(cam.pos, cam.yaw, cam.pitch, viewMat);
+  } else {
+    const h = ortho.size, w = h * aspect;
+    makeOrthographic(-w, w, -h, h, ortho.near, ortho.far, projMat);
+    buildLookAt(ortho.eye, ortho.target, ortho.up, viewMat);
+  }
+
+  // 写入 Three.js 相机（渲染器只读这三个东西）
+  camera.projectionMatrix.copy(projMat);
+  camera.projectionMatrixInverse.copy(projMat).invert();
+  worldMat.copy(viewMat).invert();       // 相机世界矩阵 = 视图矩阵的逆
+  camera.matrixWorld.copy(worldMat);
+  camera.matrixWorldInverse.copy(viewMat);
+}
+
+/* ==========================================================
+   6. HUD & 主循环
+   ========================================================== */
+function updateHUD() {
+  const p = (mode === 'persp') ? cam.pos : ortho.eye;
+  const deg = THREE.MathUtils.radToDeg;
+  hud.innerHTML =
+`模式      : <b>${mode === 'persp' ? '透视投影 · 第一人称' : '正交投影 · 上帝视角'}</b>
+位置      : <b>${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}</b>
+Yaw/Pitch : <b>${deg(cam.yaw).toFixed(1)}° / ${deg(cam.pitch).toFixed(1)}°</b>
+FOV       : <b>${deg(cam.fov).toFixed(0)}°</b>   ([ / ] 调节)
+近/远平面 : <b>${cam.near} / ${cam.far}</b>
+操作      : WASD 移动 · Space/Shift 升降 · V 切投影 · ESC 释放鼠标`;
+}
+
+let lastTime = performance.now();
+
+function animate(now) {
+  requestAnimationFrame(animate);
+  const dt = Math.min((now - lastTime) / 1000, 0.05);  // 夹紧 dt，防止切标签页后瞬移
+  lastTime = now;
+
+  updateMovement(dt);
+  updateMatrices();
+  updateHUD();
+  renderer.render(scene, camera);
+}
+
+addEventListener('resize', () => {
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+updateMatrices();
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>

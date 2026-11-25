@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>模块2 · 实体几何造型 · 观测站</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0a1424;}
+  canvas{display:block;}
+  #hud{
+    position:fixed;left:12px;top:12px;z-index:10;white-space:pre;
+    font:12px/1.7 ui-monospace,Consolas,monospace;color:#bfe3ff;
+    background:rgba(8,16,28,.62);border:1px solid rgba(80,160,255,.25);
+    border-radius:8px;padding:10px 14px;pointer-events:none;
+  }
+  #hud b{color:#7fd4ff;}
+  #overlay{
+    position:fixed;inset:0;z-index:20;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:14px;
+    background:rgba(4,8,16,.78);color:#cfe9ff;cursor:pointer;
+    font:16px/1.8 system-ui,-apple-system,sans-serif;backdrop-filter:blur(4px);
+  }
+  #overlay h1{font-size:22px;margin:0;color:#8fd8ff;letter-spacing:3px;}
+  #overlay .k{color:#7fd4ff;font-weight:700;}
+  #overlay.hide{display:none;}
+</style>
+</head>
+<body>
+
+<div id="hud"></div>
+<div id="overlay">
+  <h1>程序化秘境 · 模块2</h1>
+  <div>点击屏幕进入第一人称漫游</div>
+  <div><span class="k">WASD</span> 移动 · <span class="k">Space/Shift</span> 升降 ·
+       <span class="k">鼠标</span> 视角 · <span class="k">V</span> 切换投影 ·
+       <span class="k">ESC</span> 释放鼠标</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three-mesh-bvh": "https://unpkg.com/three-mesh-bvh@0.7.6/build/index.module.js",
+    "three-bvh-csg": "https://unpkg.com/three-bvh-csg@0.0.16/build/index.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { Brush, Evaluator, SUBTRACTION } from 'three-bvh-csg';
+
+/* ==========================================================
+   0. 渲染器 / 场景 / 灯光
+   ========================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a1424);
+scene.fog = new THREE.FogExp2(0x0a1424, 0.0032);
+
+scene.add(new THREE.HemisphereLight(0x9fd8ff, 0x102030, 1.0));
+
+/* ---- 主光源（含阴影视锥修复）---- */
+const sun = new THREE.DirectionalLight(0xffffff, 2.0);
+sun.position.set(60, 90, 40);
+sun.castShadow = true;
+
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left   = -110;
+sun.shadow.camera.right  =  110;
+sun.shadow.camera.top    =  110;
+sun.shadow.camera.bottom = -110;
+sun.shadow.camera.near   =  10;
+sun.shadow.camera.far    =  320;
+sun.shadow.camera.updateProjectionMatrix();   // ★ 关键修复：让新 frustum 生效
+sun.shadow.bias        = -0.0004;             // 抑制 shadow acne
+sun.shadow.normalBias  =  0.06;               // 抑制 peter-panning
+
+scene.add(sun);
+scene.add(sun.target);   // ★ target 显式入场景，保证其 matrixWorld 更新
+
+// 冷色轮廓光，增强观测站层次
+const rimLight = new THREE.DirectionalLight(0x66aaff, 0.9);
+rimLight.position.set(-50, 40, -60);
+scene.add(rimLight);
+
+/* --- 地面与网格 --- */
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(600, 600),
+  new THREE.MeshStandardMaterial({ color: 0x16263a, roughness: 1.0, metalness: 0.0 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+scene.add(new THREE.GridHelper(600, 120, 0x2e5c8a, 0x14263a));
+
+/* ==========================================================
+   1. 观测站基地：圆形平台
+   ========================================================== */
+const platformGeo = new THREE.CylinderGeometry(16, 17, 1.2, 64);
+const platformMat = new THREE.MeshStandardMaterial({
+  color: 0x2a4a6a, roughness: 0.75, metalness: 0.35
+});
+const platform = new THREE.Mesh(platformGeo, platformMat);
+platform.position.y = 0.6;
+platform.castShadow = true;
+platform.receiveShadow = true;
+scene.add(platform);
+
+// 平台边缘发光环
+const rimRingGeo = new THREE.TorusGeometry(16.2, 0.12, 12, 128);
+const rimRingMat = new THREE.MeshStandardMaterial({
+  color: 0x66ccff, emissive: 0x2266aa, emissiveIntensity: 1.8,
+  roughness: 0.3, metalness: 0.1
+});
+const rimRing = new THREE.Mesh(rimRingGeo, rimRingMat);
+rimRing.rotation.x = Math.PI / 2;
+rimRing.position.y = 1.22;
+scene.add(rimRing);
+
+/* ==========================================================
+   2. 手写扫描表示：贝塞尔曲线 → 环形透明管道
+   ========================================================== */
+
+/** 三次贝塞尔求值 */
+function cubicBezier(p0, p1, p2, p3, t, out) {
+  const u = 1 - t;
+  const b0 = u * u * u;
+  const b1 = 3 * u * u * t;
+  const b2 = 3 * u * t * t;
+  const b3 = t * t * t;
+  out.set(
+    b0 * p0.x + b1 * p1.x + b2 * p2.x + b3 * p3.x,
+    b0 * p0.y + b1 * p1.y + b2 * p2.y + b3 * p3.y,
+    b0 * p0.z + b1 * p1.z + b2 * p2.z + b3 * p3.z
+  );
+  return out;
+}
+
+/** 三次贝塞尔切线（归一化） */
+function cubicBezierTangent(p0, p1, p2, p3, t, out) {
+  const u = 1 - t;
+  out.set(
+    3 * u * u * (p1.x - p0.x) + 6 * u * t * (p2.x - p1.x) + 3 * t * t * (p3.x - p2.x),
+    3 * u * u * (p1.y - p0.y) + 6 * u * t * (p2.y - p1.y) + 3 * t * t * (p3.y - p2.y),
+    3 * u * u * (p1.z - p0.z) + 6 * u * t * (p2.z - p1.z) + 3 * t * t * (p3.z - p2.z)
+  );
+  return out.normalize();
+}
+
+/**
+ * 手写扫描几何体生成器（平行传输标架）
+ */
+function createSweepTube(ctrl, radius, tubularSegments = 128, radialSegments = 24) {
+  const [p0, p1, p2, p3] = ctrl;
+
+  const positions = [];
+  const normals   = [];
+  const uvs       = [];
+  const indices   = [];
+
+  const tangent  = new THREE.Vector3();
+  const normal   = new THREE.Vector3();
+  const binormal = new THREE.Vector3();
+  const tmp      = new THREE.Vector3();
+
+  const upRef = new THREE.Vector3(0, 1, 0);
+
+  // 预先采样
+  const pts  = [];
+  const tans = [];
+  for (let i = 0; i <= tubularSegments; i++) {
+    const t = i / tubularSegments;
+    pts.push(cubicBezier(p0, p1, p2, p3, t, new THREE.Vector3()));
+    tans.push(cubicBezierTangent(p0, p1, p2, p3, t, new THREE.Vector3()));
+  }
+
+  // 初始化第一个标架
+  if (Math.abs(tans[0].dot(upRef)) > 0.99) upRef.set(1, 0, 0);
+  normal.crossVectors(upRef, tans[0]).normalize();
+  binormal.crossVectors(tans[0], normal).normalize();
+
+  for (let i = 0; i <= tubularSegments; i++) {
+    tangent.copy(tans[i]);
+
+    // 平行传输
+    if (i > 0) {
+      tmp.copy(normal).addScaledVector(tangent, -normal.dot(tangent));
+      if (tmp.lengthSq() < 1e-10) tmp.crossVectors(upRef, tangent);
+      normal.copy(tmp).normalize();
+      binormal.crossVectors(tangent, normal).normalize();
+    }
+
+    const center = pts[i];
+    for (let j = 0; j <= radialSegments; j++) {
+      const v = j / radialSegments;
+      const theta = v * Math.PI * 2;
+      const sinT = Math.sin(theta);
+      const cosT = Math.cos(theta);
+
+      const nx = cosT * normal.x + sinT * binormal.x;
+      const ny = cosT * normal.y + sinT * binormal.y;
+      const nz = cosT * normal.z + sinT * binormal.z;
+
+      positions.push(
+        center.x + radius * nx,
+        center.y + radius * ny,
+        center.z + radius * nz
+      );
+      normals.push(nx, ny, nz);
+      uvs.push(i / tubularSegments, v);
+    }
+  }
+
+  const stride = radialSegments + 1;
+  for (let i = 0; i < tubularSegments; i++) {
+    for (let j = 0; j < radialSegments; j++) {
+      const a = i * stride + j;
+      const b = (i + 1) * stride + j;
+      const c = (i + 1) * stride + (j + 1);
+      const d = i * stride + (j + 1);
+      indices.push(a, b, d);
+      indices.push(b, c, d);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('normal',   new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute('uv',       new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeBoundingSphere();
+  return geo;
+}
+
+/* --- 环绕观测站的贝塞尔管道 --- */
+const tubeCtrl = [
+  new THREE.Vector3(-10, 3.0, -12),
+  new THREE.Vector3(-28, 9.0,  6),
+  new THREE.Vector3( 10, 6.5, 28),
+  new THREE.Vector3( 18, 3.5, -10)
+];
+
+const tubeGeo = createSweepTube(tubeCtrl, 1.2, 160, 28);
+
+const tubeMat = new THREE.MeshPhysicalMaterial({
+  color: 0x7fd4ff,
+  metalness: 0.0,
+  roughness: 0.12,
+  transmission: 0.85,
+  thickness: 0.8,
+  transparent: true,
+  opacity: 0.55,
+  side: THREE.DoubleSide,
+  emissive: 0x113355,
+  emissiveIntensity: 0.6,
+  clearcoat: 1.0,
+  clearcoatRoughness: 0.1
+});
+
+const tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
+tubeMesh.castShadow = true;
+tubeMesh.receiveShadow = false;
+scene.add(tubeMesh);
+
+// 管道内部能量流细线
+const coreGeo = createSweepTube(tubeCtrl, 0.25, 160, 12);
+const coreMat = new THREE.MeshBasicMaterial({ color: 0xaaeeff, transparent: true, opacity: 0.35 });
+const coreMesh = new THREE.Mesh(coreGeo, coreMat);
+scene.add(coreMesh);
+
+/* ==========================================================
+   3. CSG 布尔运算：圆柱塔楼 − 门 − 窗
+   ========================================================== */
+function buildTowerWithCSG() {
+  // 主塔楼
+  const towerGeo = new THREE.CylinderGeometry(5, 5.8, 22, 48, 1);
+  const towerBrush = new Brush(towerGeo);
+  towerBrush.position.set(0, 12.2, 0);
+  towerBrush.updateMatrixWorld();
+
+  // 门
+  const doorGeo = new THREE.BoxGeometry(3.2, 5.5, 12);
+  const doorBrush = new Brush(doorGeo);
+  doorBrush.position.set(0, 3.8, 0);
+  doorBrush.updateMatrixWorld();
+
+  // 窗
+  const windowBrushes = [];
+  for (const y of [10.5, 14.0, 17.5, 20.0]) {
+    const wGeo = new THREE.BoxGeometry(2.0, 2.2, 12);
+    const wBrush = new Brush(wGeo);
+    wBrush.position.set(0, y, 0);
+    wBrush.updateMatrixWorld();
+    windowBrushes.push(wBrush);
+  }
+
+  // 依次差集
+  const evaluator = new Evaluator();
+  let result = evaluator.evaluate(towerBrush, doorBrush, SUBTRACTION);
+  for (const w of windowBrushes) {
+    result = evaluator.evaluate(result, w, SUBTRACTION);
+  }
+
+  result.material = new THREE.MeshStandardMaterial({
+    color: 0x3a5a7a,
+    roughness: 0.55,
+    metalness: 0.45,
+    side: THREE.DoubleSide
+  });
+  result.castShadow = true;
+  result.receiveShadow = true;
+  result.position.set(0, 0, 0);
+  result.updateMatrixWorld();
+  return result;
+}
+
+const towerMesh = buildTowerWithCSG();
+scene.add(towerMesh);
+
+/* --- 塔顶观测舱 --- */
+const capGeo = new THREE.ConeGeometry(7.5, 4.5, 48, 1, true);
+const capMat = new THREE.MeshStandardMaterial({
+  color: 0x4a6a8a, roughness: 0.4, metalness: 0.6, side: THREE.DoubleSide
+});
+const cap = new THREE.Mesh(capGeo, capMat);
+cap.position.y = 25.5;
+cap.castShadow = true;
+scene.add(cap);
+
+const beaconGeo = new THREE.SphereGeometry(1.0, 24, 16);
+const beaconMat = new THREE.MeshStandardMaterial({
+  color: 0xaaeeff, emissive: 0x66ccff, emissiveIntensity: 3.0
+});
+const beacon = new THREE.Mesh(beaconGeo, beaconMat);
+beacon.position.y = 26.8;
+scene.add(beacon);
+
+const beaconLight = new THREE.PointLight(0x66ccff, 80, 60, 2);
+beaconLight.position.copy(beacon.position);
+scene.add(beaconLight);
+
+/* ==========================================================
+   4. 外围参照柱（模块 1 遗留，保留作运动视差与阴影视锥自检）
+   ========================================================== */
+let seed = 1337;
+const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+
+for (let i = 0; i < 40; i++) {
+  const r = 20 + rand() * 80;               // 半径 20 ~ 100
+  const a = rand() * Math.PI * 2;
+  const h = 2 + rand() * 10;
+  const geo = rand() > 0.5
+    ? new THREE.BoxGeometry(2.0, h, 2.0)
+    : new THREE.CylinderGeometry(0.9, 1.2, h, 12);
+  const mat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color().setHSL(0.52 + rand() * 0.2, 0.6, 0.5),
+    roughness: 0.7, metalness: 0.1
+  });
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(Math.cos(a) * r, h / 2, Math.sin(a) * r);
+  m.castShadow = true;
+  m.receiveShadow = true;
+  scene.add(m);
+}
+
+/* ==========================================================
+   5. 相机系统（与模块 1 一致）
+   ========================================================== */
+function makePerspective(fovY, aspect, n, f, out) {
+  const t = n * Math.tan(fovY * 0.5);
+  const r = t * aspect;
+  out.set(
+    n / r, 0, 0, 0,
+    0, n / t, 0, 0,
+    0, 0, -(f + n) / (f - n), -2 * f * n / (f - n),
+    0, 0, -1, 0
+  );
+  return out;
+}
+
+function makeOrthographic(l, r, b, t, n, f, out) {
+  out.set(
+    2 / (r - l), 0, 0, -(r + l) / (r - l),
+    0, 2 / (t - b), 0, -(t + b) / (t - b),
+    0, 0, -2 / (f - n), -(f + n) / (f - n),
+    0, 0, 0, 1
+  );
+  return out;
+}
+
+const _x = new THREE.Vector3(), _y = new THREE.Vector3(), _z = new THREE.Vector3();
+
+function buildViewMatrix(pos, yaw, pitch, out) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  _x.set(cy, 0, -sy);
+  _y.set(sy * sp, cp, cy * sp);
+  _z.set(sy * cp, -sp, cy * cp);
+  out.set(
+    _x.x, _x.y, _x.z, -_x.dot(pos),
+    _y.x, _y.y, _y.z, -_y.dot(pos),
+    _z.x, _z.y, _z.z, -_z.dot(pos),
+    0, 0, 0, 1
+  );
+  return out;
+}
+
+const _lookZ = new THREE.Vector3(), _lookX = new THREE.Vector3(), _lookY = new THREE.Vector3();
+function buildLookAt(eye, target, up, out) {
+  _lookZ.subVectors(eye, target).normalize();
+  _lookX.crossVectors(up, _lookZ).normalize();
+  _lookY.crossVectors(_lookZ, _lookX);
+  out.set(
+    _lookX.x, _lookX.y, _lookX.z, -_lookX.dot(eye),
+    _lookY.x, _lookY.y, _lookY.z, -_lookY.dot(eye),
+    _lookZ.x, _lookZ.y, _lookZ.z, -_lookZ.dot(eye),
+    0, 0, 0, 1
+  );
+  return out;
+}
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
+camera.matrixAutoUpdate = false;
+camera.matrixWorldAutoUpdate = false;
+
+const projMat = new THREE.Matrix4();
+const viewMat = new THREE.Matrix4();
+const worldMat = new THREE.Matrix4();
+
+const cam = {
+  pos: new THREE.Vector3(0, 8, 42),
+  yaw: 0,
+  pitch: -0.12,
+  fov: THREE.MathUtils.degToRad(60),
+  near: 0.1,
+  far: 800
+};
+
+const ortho = {
+  eye: new THREE.Vector3(58, 86, 58),
+  target: new THREE.Vector3(0, 8, 0),
+  up: new THREE.Vector3(0, 1, 0),
+  size: 62,
+  near: 0.1,
+  far: 600
+};
+
+let mode = 'persp';
+
+/* --- 输入 --- */
+const canvas = renderer.domElement;
+const overlay = document.getElementById('overlay');
+const hud = document.getElementById('hud');
+const SENS = 0.0022;
+const SPEED = 14;
+const keys = Object.create(null);
+
+overlay.addEventListener('click', () => canvas.requestPointerLock());
+canvas.addEventListener('click', () => {
+  if (document.pointerLockElement !== canvas) canvas.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', () => {
+  overlay.classList.toggle('hide', document.pointerLockElement === canvas);
+});
+document.addEventListener('mousemove', (e) => {
+  if (document.pointerLockElement !== canvas) return;
+  cam.yaw -= e.movementX * SENS;
+  cam.pitch -= e.movementY * SENS;
+  cam.pitch = THREE.MathUtils.clamp(cam.pitch, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
+});
+addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault();
+  if (e.code === 'KeyV') mode = (mode === 'persp') ? 'ortho' : 'persp';
+});
+addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+/* --- 每帧更新 --- */
+function updateMovement(dt) {
+  const fx = -Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
+  const rx = Math.cos(cam.yaw), rz = -Math.sin(cam.yaw);
+  let mx = 0, mz = 0;
+  if (keys['KeyW']) { mx += fx; mz += fz; }
+  if (keys['KeyS']) { mx -= fx; mz -= fz; }
+  if (keys['KeyD']) { mx += rx; mz += rz; }
+  if (keys['KeyA']) { mx -= rx; mz -= rz; }
+  const len = Math.hypot(mx, mz);
+  if (len > 1e-6) {
+    const s = (SPEED * dt) / len;
+    cam.pos.x += mx * s;
+    cam.pos.z += mz * s;
+  }
+  if (keys['Space']) cam.pos.y += SPEED * dt;
+  if (keys['ShiftLeft'] || keys['ShiftRight']) cam.pos.y -= SPEED * dt;
+  cam.pos.y = THREE.MathUtils.clamp(cam.pos.y, 1.2, 150);
+}
+
+function updateMatrices() {
+  const aspect = innerWidth / innerHeight;
+  if (mode === 'persp') {
+    makePerspective(cam.fov, aspect, cam.near, cam.far, projMat);
+    buildViewMatrix(cam.pos, cam.yaw, cam.pitch, viewMat);
+  } else {
+    const h = ortho.size, w = h * aspect;
+    makeOrthographic(-w, w, -h, h, ortho.near, ortho.far, projMat);
+    buildLookAt(ortho.eye, ortho.target, ortho.up, viewMat);
+  }
+  camera.projectionMatrix.copy(projMat);
+  camera.projectionMatrixInverse.copy(projMat).invert();
+  worldMat.copy(viewMat).invert();
+  camera.matrixWorld.copy(worldMat);
+  camera.matrixWorldInverse.copy(viewMat);
+}
+
+function updateHUD() {
+  const p = (mode === 'persp') ? cam.pos : ortho.eye;
+  hud.innerHTML =
+`模块 2 · 观测站
+模式      : <b>${mode === 'persp' ? '透视 · 第一人称' : '正交 · 上帝视角'}</b>
+位置      : <b>${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}</b>
+操作      : WASD · Space/Shift · 鼠标 · V 切投影 · ESC 释放`;
+}
+
+let lastTime = performance.now();
+function animate(now) {
+  requestAnimationFrame(animate);
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+  updateMovement(dt);
+  updateMatrices();
+  updateHUD();
+  renderer.render(scene, camera);
+}
+
+addEventListener('resize', () => {
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+updateMatrices();
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
